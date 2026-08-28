@@ -97,9 +97,23 @@ def download_file():
     if not target:
         return "Missing url parameter.", 400
 
+    # TikTok's CDN rejects requests that don't look like they came from a
+    # real browser referred from tiktok.com — without these headers it
+    # returns an error instead of the video bytes.
+    fetch_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.tiktok.com/",
+    }
+
     try:
-        upstream = requests.get(target, stream=True, timeout=30)
+        upstream = requests.get(target, stream=True, timeout=30, headers=fetch_headers)
         upstream.raise_for_status()
+    except requests.exceptions.HTTPError:
+        status = upstream.status_code if 'upstream' in locals() else 502
+        return f"Could not fetch the video file (upstream returned {status}).", 502
     except Exception:
         return "Could not fetch the video file.", 502
 
