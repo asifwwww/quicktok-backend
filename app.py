@@ -1,11 +1,7 @@
 """
-QuickTok backend — extracts TikTok download links using yt-dlp and
+QuickTok backend – extracts TikTok download links using yt-dlp and
 streams the video file back through this server (so file size and
 download progress show up natively in the browser).
-
-Deploy this on a platform that can run a persistent Python process
-(Render, Railway, Fly.io, a VPS, etc). It will NOT run on Cloudflare
-Pages/Workers — those only run small JS, not real binaries like yt-dlp.
 """
 
 from flask import Flask, request, jsonify, Response
@@ -14,7 +10,7 @@ import yt_dlp
 import requests
 
 app = Flask(__name__)
-CORS(app)  # allow the Cloudflare Pages frontend (different domain) to call this API
+CORS(app)  # allow frontend to call this API
 
 
 @app.route("/")
@@ -33,9 +29,11 @@ def fetch():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        # Some TikTok links need a normal browser User-Agent to resolve.
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
         },
     }
 
@@ -43,7 +41,7 @@ def fetch():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception:
-        return jsonify({"error": "Could not process this link. Check it's a valid TikTok video URL."}), 502
+        return jsonify({"error": "Could not process this link. Check it's a valid TikTok URL."}), 400
 
     formats = []
     seen_labels = set()
@@ -52,60 +50,76 @@ def fetch():
         if ext not in ("mp4", "m4a"):
             continue
         is_audio = ext == "m4a"
-        label = f.get("format_note") or f.get("format_id") or ext
-        display = "Audio (m4a)" if is_audio else f"{label} (mp4)"
-        if display in seen_labels:
+        vcodec = f.get("vcodec")
+        if not is_audio and vcodec == "none":
             continue
-        seen_labels.add(display)
-        formats.append(
-            {
-                "quality": display,
-                "url": f.get("url"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
-                "is_audio": is_audio,
-            }
-        )
 
-    # Fallback: some extractions only expose a single top-level url.
-    if not formats and info.get("url"):
-        formats.append(
-            {
-                "quality": "Video (mp4)",
-                "url": info["url"],
-                "filesize": info.get("filesize"),
-                "is_audio": False,
-            }
-        )
+        raw_url = f.get("url")
+        if not raw_url:
+            continue
 
-    if not formats:
-        return jsonify({"error": "No downloadable video found for that link."}), 404
+        filesize = f.get("filesize") or f.get("filesize_approx") or 0
+        format_note = f.get("format_note") or ""
+        height = f.get("height")
 
-    return jsonify(
-        {
-            "title": info.get("title"),
-            "author": info.get("uploader") or info.get("creator"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "formats": formats,
-        }
-    )
+        if is_audio:
+            label = "Audio Only (MP3/M4A)"
+        elif height:
+            label = f"Video ({height}p)"
+        elif format_note:
+            label = f"Video ({format_note})"
+        else:
+            label = "Video (Standard)"
+
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+
+        formats.append({
+            "label": label,
+            "quality": height or 0,
+            "ext": ext,
+            "filesize": filesize,
+            "url": raw_url,
+            "is_audio": is_audio,
+        })
+
+    formats.sort(key=lambda x: (x["is_audio"], x["quality"]), reverse=True)
+
+    direct_url = info.get("url")
+    if direct_url and not any(fmt["url"] == direct_url for fmt in formats):
+        formats.insert(0, {
+            "label": "Video (Best Quality)",
+            "quality": 1080,
+            "ext": "mp4",
+            "filesize": 0,
+            "url": direct_url,
+            "is_audio": False,
+        })
+
+    return jsonify({
+        "title": info.get("title") or "TikTok Video",
+        "author": info.get("uploader") or info.get("uploader_id") or "Unknown Creator",
+        "thumbnail": info.get("thumbnail") or "",
+        "duration": info.get("duration") or 0,
+        "formats": formats,
+    })
 
 
-@app.route("/api/download-file")
+@app.route("/api/download-file", methods=["GET"])
 def download_file():
     target = request.args.get("url")
     if not target:
         return "Missing url parameter.", 400
 
-    # TikTok's CDN rejects requests that don't look like they came from a
-    # real browser referred from tiktok.com — without these headers it
-    # returns an error instead of the video bytes.
+    # TikTok CDN Bypass Headers
     fetch_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
         "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
     }
 
     try:
@@ -114,8 +128,8 @@ def download_file():
     except requests.exceptions.HTTPError:
         status = upstream.status_code if 'upstream' in locals() else 502
         return f"Could not fetch the video file (upstream returned {status}).", 502
-    except Exception:
-        return "Could not fetch the video file.", 502
+    except Exception as e:
+        return f"Could not fetch the video file: {str(e)}", 502
 
     def generate():
         for chunk in upstream.iter_content(chunk_size=65536):
@@ -134,4 +148,4 @@ def download_file():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=5000, debug=True)
