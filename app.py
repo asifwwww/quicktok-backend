@@ -1,6 +1,11 @@
 """
-QuickTok backend – extracts TikTok download links using yt-dlp and
-streams the video file back through this server.
+QuickTok backend — extracts TikTok download links using yt-dlp and
+streams the video file back through this server (so file size and
+download progress show up natively in the browser).
+
+Deploy this on a platform that can run a persistent Python process
+(Render, Railway, Fly.io, a VPS, etc). It will NOT run on Cloudflare
+Pages/Workers — those only run small JS, not real binaries like yt-dlp.
 """
 
 from flask import Flask, request, jsonify, Response
@@ -9,7 +14,7 @@ import yt_dlp
 import requests
 
 app = Flask(__name__)
-CORS(app)  # allow frontend to call this API
+CORS(app)  # allow the Cloudflare Pages frontend (different domain) to call this API
 
 
 @app.route("/")
@@ -28,11 +33,9 @@ def fetch():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        # Some TikTok links need a normal browser User-Agent to resolve.
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         },
     }
 
@@ -40,7 +43,7 @@ def fetch():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception:
-        return jsonify({"error": "Could not process this link. Check it's a valid TikTok URL."}), 400
+        return jsonify({"error": "Could not process this link. Check it's a valid TikTok video URL."}), 502
 
     formats = []
     seen_labels = set()
@@ -49,89 +52,111 @@ def fetch():
         if ext not in ("mp4", "m4a"):
             continue
         is_audio = ext == "m4a"
-        vcodec = f.get("vcodec")
-        if not is_audio and vcodec == "none":
+        label = f.get("format_note") or f.get("format_id") or ext
+        display = "Audio (m4a)" if is_audio else f"{label} (mp4)"
+        if display in seen_labels:
             continue
+        seen_labels.add(display)
+        formats.append(
+            {
+                "quality": display,
+                "url": f.get("url"),
+                "filesize": f.get("filesize") or f.get("filesize_approx"),
+                "is_audio": is_audio,
+            }
+        )
 
-        raw_url = f.get("url")
-        if not raw_url:
-            continue
+    # Fallback: some extractions only expose a single top-level url.
+    if not formats and info.get("url"):
+        formats.append(
+            {
+                "quality": "Video (mp4)",
+                "url": info["url"],
+                "filesize": info.get("filesize"),
+                "is_audio": False,
+            }
+        )
 
-        filesize = f.get("filesize") or f.get("filesize_approx") or 0
-        format_note = f.get("format_note") or ""
-        height = f.get("height")
+    if not formats:
+        return jsonify({"error": "No downloadable video found for that link."}), 404
 
-        if is_audio:
-            label = "Audio Only (MP3/M4A)"
-        elif height:
-            label = f"Video ({height}p)"
-        elif format_note:
-            label = f"Video ({format_note})"
-        else:
-            label = "Video (Standard)"
-
-        if label in seen_labels:
-            continue
-        seen_labels.add(label)
-
-        formats.append({
-            "label": label,
-            "quality": height or 0,
-            "ext": ext,
-            "filesize": filesize,
-            "url": raw_url,
-            "is_audio": is_audio,
-        })
-
-    formats.sort(key=lambda x: (x["is_audio"], x["quality"]), reverse=True)
-
-    direct_url = info.get("url")
-    if direct_url and not any(fmt["url"] == direct_url for fmt in formats):
-        formats.insert(0, {
-            "label": "Video (Best Quality)",
-            "quality": 1080,
-            "ext": "mp4",
-            "filesize": 0,
-            "url": direct_url,
-            "is_audio": False,
-        })
-
-    return jsonify({
-        "title": info.get("title") or "TikTok Video",
-        "author": info.get("uploader") or info.get("uploader_id") or "Unknown Creator",
-        "thumbnail": info.get("thumbnail") or "",
-        "duration": info.get("duration") or 0,
-        "formats": formats,
-    })
+    return jsonify(
+        {
+            "title": info.get("title"),
+            "author": info.get("uploader") or info.get("creator"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "formats": formats,
+        }
+    )
 
 
-@app.route("/api/download-file", methods=["GET"])
+@app.route("/api/download-file")
 def download_file():
-    target = request.args.get("url")
-    if not target:
-        return "Missing url parameter.", 400
+    """
+    Re-extracts the video right at download time instead of reusing a link
+    handed out earlier by /api/fetch. TikTok's CDN links expire within
+    minutes (sometimes seconds), so reusing an old link causes 403 errors.
+    Fetching fresh, immediately before streaming, avoids that.
+    """
+    page_url = request.args.get("page_url")
+    quality = request.args.get("quality")
+    if not page_url or not quality:
+        return "Missing page_url or quality parameter.", 400
 
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+    except Exception:
+        return "Could not re-fetch this video. The link may no longer be valid.", 502
+
+    match = None
+    for f in info.get("formats", []) or []:
+        ext = f.get("ext")
+        if ext not in ("mp4", "m4a"):
+            continue
+        is_audio = ext == "m4a"
+        label = f.get("format_note") or f.get("format_id") or ext
+        display = "Audio (m4a)" if is_audio else f"{label} (mp4)"
+        if display == quality:
+            match = f
+            break
+
+    if not match and info.get("url"):
+        match = {"url": info["url"], "http_headers": info.get("http_headers")}
+
+    if not match or not match.get("url"):
+        return "That quality is no longer available for this video.", 404
+
+    # Use the exact headers yt-dlp resolved for this specific CDN url when
+    # available — TikTok's CDN often requires the matching Referer/cookie
+    # that yt-dlp already worked out, not a generic one.
     fetch_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
         "Referer": "https://www.tiktok.com/",
-        "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
     }
+    fetch_headers.update(match.get("http_headers") or {})
 
     try:
-        upstream = requests.get(target, stream=True, timeout=30, headers=fetch_headers)
+        upstream = requests.get(match["url"], stream=True, timeout=30, headers=fetch_headers)
         upstream.raise_for_status()
     except requests.exceptions.HTTPError:
-        status = upstream.status_code if 'upstream' in locals() else 502
+        status = upstream.status_code if "upstream" in locals() else 502
         return f"Could not fetch the video file (upstream returned {status}).", 502
-    except Exception as e:
-        return f"Could not fetch the video file: {str(e)}", 502
+    except Exception:
+        return "Could not fetch the video file.", 502
 
     def generate():
         for chunk in upstream.iter_content(chunk_size=65536):
@@ -150,4 +175,4 @@ def download_file():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=8000)
