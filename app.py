@@ -1,12 +1,3 @@
-"""
-QuickTok backend — fetches TikTok download links via tikwm.com, a free,
-widely-used public API that already handles TikTok's CDN signing/IP
-protections on its own infrastructure. This avoids the 403 errors we hit
-trying to fetch TikTok's CDN directly (from a cloud server OR a client
-browser) — tikwm's own domain serves the files, so no TikTok CDN request
-happens on our side at all.
-"""
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
@@ -14,66 +5,35 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-TIKWM_API = "https://www.tikwm.com/api/"
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-}
-
-
-@app.route("/")
-def health():
-    return jsonify({"status": "ok", "service": "quicktok-backend"})
-
+SOCIALKIT_API = "https://api.socialkit.dev/tiktok/download"
 
 @app.route("/api/fetch", methods=["POST"])
-def fetch():
-    data = request.get_json(force=True, silent=True) or {}
-    url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "Missing TikTok video URL."}), 400
+def fetch_tiktok():
+    data = request.get_json() or {}
+    video_url = data.get("url")
+
+    if not video_url:
+        return jsonify({"error": "Please provide a valid TikTok URL."}), 400
 
     try:
-        resp = requests.get(
-            TIKWM_API, params={"url": url, "hd": 1}, headers=REQUEST_HEADERS, timeout=25
-        )
-        payload = resp.json()
-    except Exception as exc:
-        return jsonify({"error": f"Could not reach the download service ({type(exc).__name__}). Try again in a moment."}), 502
+        # Request data from SocialKit API
+        response = requests.get(SOCIALKIT_API, params={"url": video_url}, timeout=15)
+        res_data = response.json()
 
-    if payload.get("code") != 0 or not payload.get("data"):
-        return jsonify({"error": "No downloadable video found for that link."}), 404
+        if response.status_code != 200 or not res_data.get("success", False):
+            return jsonify({"error": "Failed to fetch video using SocialKit API."}), 400
 
-    d = payload["data"]
-    formats = []
+        video_info = res_data.get("data", {})
 
-    if d.get("play"):
-        formats.append({"quality": "Video — No Watermark", "url": d["play"], "filesize": d.get("size")})
-    if d.get("hdplay") and d.get("hdplay") != d.get("play"):
-        formats.append({"quality": "Video — No Watermark (HD)", "url": d["hdplay"], "filesize": d.get("hd_size")})
-    if d.get("wmplay"):
-        formats.append({"quality": "Video — With Watermark", "url": d["wmplay"], "filesize": d.get("wm_size")})
-    if d.get("music"):
-        formats.append({"quality": "Audio (mp3)", "url": d["music"], "filesize": None})
+        return jsonify({
+            "title": video_info.get("title", "TikTok Video"),
+            "author": video_info.get("author", {}).get("nickname", "Unknown"),
+            "thumbnail": video_info.get("cover", ""),
+            "download_url": video_info.get("play", "")  # Watermark-less direct play link
+        })
 
-    if not formats:
-        return jsonify({"error": "No downloadable video found for that link."}), 404
-
-    author = (d.get("author") or {}).get("nickname")
-
-    return jsonify(
-        {
-            "title": d.get("title"),
-            "author": author,
-            "duration": d.get("duration"),
-            "thumbnail": d.get("cover") or d.get("origin_cover"),
-            "formats": formats,
-        }
-    )
-
+    except Exception as e:
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=5000)
