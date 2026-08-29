@@ -15,6 +15,13 @@ app = Flask(__name__)
 CORS(app)
 
 TIKWM_API = "https://www.tikwm.com/api/"
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 
 
 @app.route("/")
@@ -30,10 +37,12 @@ def fetch():
         return jsonify({"error": "Missing TikTok video URL."}), 400
 
     try:
-        resp = requests.get(TIKWM_API, params={"url": url, "hd": 1}, timeout=20)
+        resp = requests.get(
+            TIKWM_API, params={"url": url, "hd": 1}, headers=REQUEST_HEADERS, timeout=25
+        )
         payload = resp.json()
-    except Exception:
-        return jsonify({"error": "Could not reach the download service. Try again in a moment."}), 502
+    except Exception as exc:
+        return jsonify({"error": f"Could not reach the download service ({type(exc).__name__}). Try again in a moment."}), 502
 
     if payload.get("code") != 0 or not payload.get("data"):
         return jsonify({"error": "No downloadable video found for that link."}), 404
